@@ -1,17 +1,33 @@
 # GFS Data Download Configuration
 # See https://noaa-gfs-bdp-pds.s3.amazonaws.com for available data
 
-# Forecast initialization date (YYYY-MM-DD)
+# Forecast initialization date (YYYY-MM-DD).
+# Used when `date_range` below is not set.
 date: "2026-05-01"
 
-# Forecast cycle hour (0, 6, 12, or 18)
-cycle: 12
+# Optional date range for batch / historical downloads.
+# When present, this OVERRIDES `date` and downloads every cycle init in [start, end].
+# Files are organised under <output_dir>/<YYYYMMDD>/<CC>z/ to avoid collisions.
+# date_range:
+#   start: "2026-01-01"
+#   end:   "2026-02-01"
+#   step_days: 1
 
-# Forecast hour range to download
+# Forecast cycle hour. Either a single value or a list — applies to every date.
+#   Single cycle: cycle: 12
+#   Multiple cycles: cycles: [0, 6, 12, 18]
+# When `cycles` is set it OVERRIDES `cycle`.
+cycle: 12
+# cycles: [0, 6, 12, 18]
+
+# Forecast hour range to download (relative to each cycle init time).
+# Either a {start, end, step} block, or the special string "all" to
+# auto-discover every available forecast hour on S3 for each (date, cycle).
 forecast_hours:
   start: 0    # first forecast hour
   end: 24     # last forecast hour (inclusive)
   step: 6     # interval between forecast hours
+# forecast_hours: all   # download every available f-hour (equivalent to CLI --all-hours)
 
 # Variables to download (must match NCEP short names and level strings exactly)
 variables:

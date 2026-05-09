@@ -1,7 +1,9 @@
 """HTTP download engine with range-request support for slicing GRIB2 files from S3."""
 
 import logging
+import re
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import requests
@@ -9,6 +11,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 S3_BASE = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
+S3_NS = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
 
 # Retry settings
 MAX_RETRIES = 3
@@ -130,3 +133,57 @@ def merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
             merged.append([start, end])
 
     return [(s, e) for s, e in merged]
+
+
+
+def list_available_forecast_hours(date: str, cycle: int) -> list[int]:
+    """Query NOAA S3 LIST API to find every forecast hour available for a given init.
+
+    Returns a sorted, deduplicated list of forecast hour integers (e.g.
+    [0, 1, 2, ..., 120, 123, 126, ..., 384]).
+    """
+    date_stripped = date.replace("-", "")
+    cycle_str = f"{cycle:02d}"
+    prefix = f"gfs.{date_stripped}/{cycle_str}/atmos/gfs.t{cycle_str}z.pgrb2.0p25.f"
+    list_url = f"{S3_BASE}/"
+
+    pattern = re.compile(r"\.pgrb2\.0p25\.f(\d{3,})(?:\.idx)?$")
+    hours: set[int] = set()
+    continuation: str | None = None
+
+    while True:
+        params = {
+            "list-type": "2",
+            "prefix": prefix,
+            "max-keys": "1000",
+        }
+        if continuation:
+            params["continuation-token"] = continuation
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.get(list_url, params=params, timeout=60)
+                resp.raise_for_status()
+                break
+            except requests.RequestException as e:
+                delay = RETRY_DELAY * (2 ** attempt)
+                logger.warning(f"S3 LIST failed (attempt {attempt+1}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(delay)
+                else:
+                    raise
+
+        root = ET.fromstring(resp.text)
+        for key_el in root.findall("s3:Contents/s3:Key", S3_NS):
+            m = pattern.search(key_el.text or "")
+            if m:
+                hours.add(int(m.group(1)))
+
+        truncated = root.findtext("s3:IsTruncated", default="false", namespaces=S3_NS)
+        if truncated.lower() != "true":
+            break
+        continuation = root.findtext("s3:NextContinuationToken", namespaces=S3_NS)
+        if not continuation:
+            break
+
+    return sorted(hours)
