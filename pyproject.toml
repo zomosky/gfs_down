@@ -1,0 +1,15 @@
+[project]
+name = "gfsdown"
+version = "0.1.0"
+description = "GFS GRIB2 data downloader with variable/region slicing support"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyyaml>=6.0",
+    "requests>=2.31",
+    "cfgrib>=0.9",
+    "xarray>=2024",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+    "cartopy>=0.23",
+]

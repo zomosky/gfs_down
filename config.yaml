@@ -1,0 +1,39 @@
+# GFS Data Download Configuration
+# See https://noaa-gfs-bdp-pds.s3.amazonaws.com for available data
+
+# Forecast initialization date (YYYY-MM-DD)
+date: "2026-05-01"
+
+# Forecast cycle hour (0, 6, 12, or 18)
+cycle: 12
+
+# Forecast hour range to download
+forecast_hours:
+  start: 0    # first forecast hour
+  end: 24     # last forecast hour (inclusive)
+  step: 6     # interval between forecast hours
+
+# Variables to download (must match NCEP short names and level strings exactly)
+variables:
+  - name: "UGRD"
+    level: "10 m above ground"
+  - name: "VGRD"
+    level: "10 m above ground"
+
+# Geographic region to subset (degrees). Comment out to download full global data.
+region:
+  lat_min: 15.0
+  lat_max: 55.0
+  lon_min: 105.0
+  lon_max: 150.0
+
+# Output directory for downloaded files
+output_dir: "./output"
+
+# Plotting settings
+plot:
+  enabled: true
+  type: "wind_speed"       # "wind_speed" computes sqrt(u^2 + v^2)
+  output_format: "png"     # "png" or "pdf"
+  dpi: 300
+  colormap: "viridis"
