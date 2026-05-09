@@ -57,7 +57,7 @@ class DateRange:
 
 @dataclass
 class PlotConfig:
-    enabled: bool = True
+    enabled: bool = False
     plot_type: str = "wind_speed"
     output_format: str = "png"
     dpi: int = 300
@@ -169,7 +169,7 @@ def load_config(path: str | Path) -> GFSConfig:
 
     plot_raw = raw.get("plot", {})
     plot = PlotConfig(
-        enabled=plot_raw.get("enabled", True),
+        enabled=plot_raw.get("enabled", False),
         plot_type=plot_raw.get("type", "wind_speed"),
         output_format=plot_raw.get("output_format", "png"),
         dpi=plot_raw.get("dpi", 300),

@@ -1,6 +1,9 @@
 """Orchestration: iterate forecast hours, parse idx, filter variables, download sliced GRIB2."""
 
+import glob
+import json
 import logging
+from datetime import datetime
 from pathlib import Path
 
 from gfsdown.config import GFSConfig
@@ -15,6 +18,56 @@ from gfsdown.downloader import (
 from gfsdown.index_parser import filter_entries, parse_idx
 
 logger = logging.getLogger(__name__)
+
+# Files smaller than this are treated as partial/empty and re-downloaded.
+MIN_VALID_GRIB_BYTES = 1024
+
+
+class DownloadError(Exception):
+    """Raised when a per-(date,cycle,hour) download exhausts retries."""
+
+
+def _clean_cfgrib_cache(path: Path) -> None:
+    """Remove cfgrib's on-disk .grib2.*.idx cache for a given file."""
+    for f in glob.glob(str(path) + ".*.idx"):
+        Path(f).unlink(missing_ok=True)
+
+
+def _validate_existing_grib(path: Path) -> bool:
+    """Lightweight metadata-only validation of an existing sliced GRIB2 file.
+
+    Opens the file via cfgrib (which scans the GRIB message headers but does
+    not load array data) and confirms at least one data variable was decoded.
+    Returns False on any read error so the caller can re-download.
+    """
+    try:
+        import cfgrib  # local import: keeps slicer import-time light
+    except ImportError as e:
+        logger.warning(f"cfgrib unavailable, skipping validation of {path}: {e}")
+        return True  # fall back to size-only check upstream
+
+    _clean_cfgrib_cache(path)
+    try:
+        # indexpath="" prevents cfgrib from writing a .grib2.*.idx cache during validation.
+        # open_datasets() (plural) returns one xr.Dataset per hypercube, so it tolerates
+        # mixed-level slices (surface + heightAboveGround + isobaricInhPa, ...).
+        datasets = cfgrib.open_datasets(
+            str(path),
+            backend_kwargs={"indexpath": ""},
+        )
+    except Exception as e:
+        logger.warning(f"GRIB metadata read failed for {path}: {e}")
+        return False
+
+    try:
+        total_vars = sum(len(ds.data_vars) for ds in datasets)
+        return total_vars > 0
+    finally:
+        for ds in datasets:
+            try:
+                ds.close()
+            except Exception:
+                pass
 
 
 def date_output_dir(base_dir: Path, date: str, cycle: int) -> Path:
@@ -31,8 +84,29 @@ def download_forecast_hour(
 ) -> Path | None:
     """Download sliced GRIB2 for one (date, cycle, forecast_hour).
 
-    Returns the output file path, or None if no matching variables found.
+    Returns the output file path on success or when the file already exists
+    (resume), or None when no requested variable is present in the idx.
+    Raises DownloadError if any underlying HTTP step fails after retries.
     """
+    output_path = output_dir / f"gfs_f{forecast_hour:03d}.grib2"
+
+    # Resume: skip files already on disk that pass a lightweight metadata check.
+    if output_path.exists() and output_path.stat().st_size >= MIN_VALID_GRIB_BYTES:
+        if _validate_existing_grib(output_path):
+            logger.info(
+                f"Skipping {date} {cycle:02d}Z f{forecast_hour:03d}: already downloaded "
+                f"({output_path.stat().st_size:,} bytes at {output_path})"
+            )
+            return output_path
+        logger.warning(
+            f"Existing file {output_path} failed metadata validation; will re-download"
+        )
+        try:
+            output_path.unlink()
+            _clean_cfgrib_cache(output_path)
+        except OSError as e:
+            logger.warning(f"Could not remove invalid file {output_path}: {e}")
+
     idx_url = build_idx_url(date, cycle, forecast_hour)
     grib_url = build_grib_url(date, cycle, forecast_hour)
 
@@ -41,8 +115,7 @@ def download_forecast_hour(
     try:
         idx_text = download_text(idx_url)
     except Exception as e:
-        logger.error(f"Failed to download idx for {date} {cycle:02d}Z f{forecast_hour:03d}: {e}")
-        return None
+        raise DownloadError(f"idx fetch failed: {e}") from e
 
     entries = parse_idx(idx_text)
     if not entries:
@@ -65,8 +138,17 @@ def download_forecast_hour(
     if not all_ranges:
         return None
 
-    output_path = output_dir / f"gfs_f{forecast_hour:03d}.grib2"
-    download_sliced_grib(all_ranges, grib_url, output_path)
+    try:
+        download_sliced_grib(all_ranges, grib_url, output_path)
+    except Exception as e:
+        # Remove partial file so the next run can resume cleanly.
+        if output_path.exists():
+            try:
+                output_path.unlink()
+                logger.info(f"  Removed partial file {output_path}")
+            except OSError as cleanup_err:
+                logger.warning(f"  Could not remove partial file {output_path}: {cleanup_err}")
+        raise DownloadError(f"byte-range fetch failed: {e}") from e
 
     file_size = output_path.stat().st_size
     logger.info(f"  Saved {output_path.relative_to(output_path.parents[2]) if len(output_path.parents) >= 3 else output_path.name} ({file_size:,} bytes)")
@@ -74,13 +156,23 @@ def download_forecast_hour(
     return output_path
 
 
-def download_all(config: GFSConfig) -> list[tuple[str, int, Path]]:
+def download_all(
+    config: GFSConfig,
+) -> tuple[list[tuple[str, int, Path]], list[tuple[str, int, int, str]]]:
     """Download all (date, cycle, forecast_hour) combinations specified in config.
 
     Files are organised under <output_dir>/<YYYYMMDD>/<CC>z/gfs_fXXX.grib2,
-    so different cycles for the same date never collide.
+    so different cycles for the same date never collide. Existing files are
+    skipped (resume), letting interrupted runs continue without re-downloading.
+    Per-init S3 LIST failures and per-hour download failures are logged and
+    collected, but never abort the whole batch.
 
-    Returns list of (date, cycle, path) tuples for successfully downloaded files.
+    Returns:
+        (succeeded, failed) where
+            succeeded = list of (date, cycle, path) for files now on disk;
+            failed = list of (date, cycle, forecast_hour, reason) for hours that
+                     exhausted retries (S3 LIST failures are recorded with
+                     forecast_hour=-1).
     """
     base_dir = Path(config.output_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -103,7 +195,8 @@ def download_all(config: GFSConfig) -> list[tuple[str, int, Path]]:
             f"f{hours[0]:03d}-f{hours[-1]:03d})"
         )
 
-    downloaded: list[tuple[str, int, Path]] = []
+    succeeded: list[tuple[str, int, Path]] = []
+    failed: list[tuple[str, int, int, str]] = []
     for date in dates:
         for cycle in cycles:
             out_dir = date_output_dir(base_dir, date, cycle)
@@ -114,6 +207,7 @@ def download_all(config: GFSConfig) -> list[tuple[str, int, Path]]:
                     hours = list_available_forecast_hours(date, cycle)
                 except Exception as e:
                     logger.error(f"Failed S3 LIST for {date} {cycle:02d}Z, skipping: {e}")
+                    failed.append((date, cycle, -1, f"S3 LIST failed: {e}"))
                     continue
                 if not hours:
                     logger.warning(f"No forecast files found on S3 for {date} {cycle:02d}Z, skipping")
@@ -127,9 +221,58 @@ def download_all(config: GFSConfig) -> list[tuple[str, int, Path]]:
                 logger.info(f"=== {date} {cycle:02d}Z -> {out_dir} ===")
 
             for hour in hours:
-                result = download_forecast_hour(config, date, cycle, hour, out_dir)
+                try:
+                    result = download_forecast_hour(config, date, cycle, hour, out_dir)
+                except DownloadError as e:
+                    logger.error(f"Failed {date} {cycle:02d}Z f{hour:03d}: {e}")
+                    failed.append((date, cycle, hour, str(e)))
+                    continue
                 if result:
-                    downloaded.append((date, cycle, result))
+                    succeeded.append((date, cycle, result))
 
-    logger.info(f"Downloaded {len(downloaded)} file(s)")
-    return downloaded
+    if failed:
+        logger.error(
+            f"Download summary: {len(succeeded)} succeeded, {len(failed)} failed"
+        )
+        for date, cycle, hour, reason in failed:
+            label = "S3-LIST" if hour < 0 else f"f{hour:03d}"
+            logger.error(f"  FAILED  {date} {cycle:02d}Z {label}: {reason}")
+    else:
+        logger.info(f"Download summary: {len(succeeded)} succeeded, 0 failed")
+
+    write_run_report(base_dir, succeeded, failed)
+
+    return succeeded, failed
+
+
+def write_run_report(
+    output_dir: Path,
+    succeeded: list[tuple[str, int, Path]],
+    failed: list[tuple[str, int, int, str]],
+) -> Path:
+    """Write a JSON report of the latest run to <output_dir>/logs/last_run.json.
+
+    The file is overwritten on every run so callers can drive a retry workflow
+    by inspecting `failed`. Returns the report path.
+    """
+    log_dir = output_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    report_path = log_dir / "last_run.json"
+
+    payload = {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "succeeded_count": len(succeeded),
+        "failed_count": len(failed),
+        "failed": [
+            {
+                "date": date,
+                "cycle": cycle,
+                "forecast_hour": hour,
+                "reason": reason,
+            }
+            for date, cycle, hour, reason in failed
+        ],
+    }
+    report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    logger.info(f"Run report written to {report_path}")
+    return report_path

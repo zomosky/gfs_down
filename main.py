@@ -4,9 +4,20 @@
 import argparse
 import logging
 import sys
+import warnings
+from datetime import datetime
 from pathlib import Path
 
-from gfsdown.config import VALID_CYCLES, DateRange, load_config
+# cfgrib >= 0.9.15 still calls xr.merge with the legacy default `compat`,
+# emitting one FutureWarning per open_datasets() call. Filter it before any
+# cfgrib import so resume validation doesn't spam the log.
+warnings.filterwarnings(
+    "ignore",
+    message="In a future version of xarray the default value for compat",
+    category=FutureWarning,
+)
+
+from gfsdown.config import VALID_CYCLES, DateRange, ForecastRange, load_config
 from gfsdown.downloader import build_idx_url, download_text, list_available_forecast_hours
 from gfsdown.index_parser import classify_variables, list_all_variables, parse_idx
 from gfsdown.plotter import compute_wind_speed, plot_wind_speed
@@ -26,6 +37,24 @@ def parse_date_range_arg(value: str) -> DateRange:
             f"--date-range must be START:END or START:END:STEP (got {value!r})"
         )
     return DateRange(start=start, end=end, step_days=int(step))
+
+
+def parse_fhours_arg(value: str) -> ForecastRange:
+    """Parse --fhours argument: 'N' (single hour) or 'START:END' or 'START:END:STEP'."""
+    parts = value.split(":")
+    try:
+        if len(parts) == 1:
+            n = int(parts[0])
+            return ForecastRange(start=n, end=n, step=1)
+        elif len(parts) == 2:
+            return ForecastRange(start=int(parts[0]), end=int(parts[1]), step=1)
+        elif len(parts) == 3:
+            return ForecastRange(start=int(parts[0]), end=int(parts[1]), step=int(parts[2]))
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError(
+        f"--fhours must be N, START:END, or START:END:STEP (got {value!r})"
+    )
 
 
 def parse_cycles_arg(value: str) -> list[int]:
@@ -48,15 +77,9 @@ def parse_cycles_arg(value: str) -> list[int]:
 
 def apply_cli_overrides(config, args):
     """Apply CLI flag overrides on top of the loaded config (in-place)."""
-    # Cycle(s): plural takes precedence over singular when both supplied.
     if args.cycles is not None:
         config.cycles = args.cycles
         config.cycle = config.cycles[0]
-    elif args.cycle is not None:
-        if args.cycle not in VALID_CYCLES:
-            raise SystemExit(f"--cycle must be one of {VALID_CYCLES}, got {args.cycle}")
-        config.cycles = [args.cycle]
-        config.cycle = args.cycle
 
     if args.date_range is not None:
         config.date_range = args.date_range
@@ -67,9 +90,13 @@ def apply_cli_overrides(config, args):
         config.dates = [args.date]
         config.date = args.date
 
+    # forecast hours: --fhours and --all-hours are mutually exclusive (validated in main()).
     if args.all_hours:
         config.all_hours = True
         config.forecast_hours = None
+    elif args.fhours is not None:
+        config.all_hours = False
+        config.forecast_hours = args.fhours
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,15 +106,56 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def setup_file_logging(output_dir: Path) -> Path:
+    """Mirror the console log stream to <output_dir>/logs/gfsdown_<timestamp>.log.
+
+    Adds a FileHandler to the root logger so every module's INFO+ messages are
+    captured. Returns the path of the new log file. Safe to call multiple times
+    in one process — duplicate handlers are not added.
+    """
+    log_dir = output_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"gfsdown_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    root = logging.getLogger()
+    for h in root.handlers:
+        if isinstance(h, logging.FileHandler) and Path(h.baseFilename) == log_path:
+            return log_path
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    root.addHandler(fh)
+    # Route warnings.warn(...) through logging so they land in the log file.
+    logging.captureWarnings(True)
+    logger.info(f"Logging to {log_path}")
+    return log_path
+
+
 def cmd_download(args, config):
     """Download GRIB2 data based on config."""
-    downloaded = download_all(config)
+    downloaded, failed = download_all(config)
 
     if not downloaded:
-        logger.error("No data downloaded. Check config variables and levels.")
+        if failed:
+            logger.error(
+                f"No data downloaded. {len(failed)} file(s) failed after retries; "
+                f"re-run the same command to resume."
+            )
+        else:
+            logger.error("No data downloaded. Check config variables and levels.")
         sys.exit(1)
 
-    logger.info(f"Download complete: {len(downloaded)} file(s)")
+    if failed:
+        logger.warning(
+            f"Download complete with errors: {len(downloaded)} succeeded, "
+            f"{len(failed)} failed. Re-run the same command to retry the failed hours."
+        )
+    else:
+        logger.info(f"Download complete: {len(downloaded)} file(s)")
 
     # Plot if enabled
     if config.plot.enabled and config.plot.plot_type == "wind_speed":
@@ -268,14 +336,20 @@ def main():
         help="Forecast hour for --list-vars (default: first hour from config)",
     )
     parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Generate wind-speed plots after download (off by default).",
+    )
+    parser.add_argument(
         "--no-plot",
         action="store_true",
-        help="Skip plotting after download",
+        help="Force-disable plotting even if config.yaml has plot.enabled: true. "
+             "Conflicts with --plot.",
     )
     parser.add_argument(
         "--demo",
         action="store_true",
-        help="Run demo: download wind speed for config date and plot",
+        help="Run demo with the project's config.yaml and force plotting on.",
     )
     # ── Lightweight overrides for config.yaml ─────────────────────────
     parser.add_argument(
@@ -293,24 +367,26 @@ def main():
              "2026-01-01:2026-02-01:7 (step in days, default 1).",
     )
     parser.add_argument(
-        "--cycle",
-        type=int,
-        default=None,
-        choices=VALID_CYCLES,
-        help="Override single forecast cycle (0/6/12/18). Conflicts with --cycles.",
-    )
-    parser.add_argument(
         "--cycles",
         type=parse_cycles_arg,
         default=None,
-        metavar="C1,C2,...",
-        help="Override with multiple cycles, comma-separated, e.g. 0,6,12,18.",
+        metavar="C[,C,...]",
+        help="Override forecast cycle(s), one or more from {0,6,12,18} comma-separated. "
+             "Examples: --cycles 12  or  --cycles 0,6,12,18.",
+    )
+    parser.add_argument(
+        "--fhours",
+        type=parse_fhours_arg,
+        default=None,
+        metavar="N | START:END | START:END:STEP",
+        help="Override forecast hours: single hour (e.g. 1), range (0:24), or "
+             "range with step (0:120:3). Conflicts with --all-hours.",
     )
     parser.add_argument(
         "--all-hours",
         action="store_true",
         help="Download every available forecast hour on S3 for each (date, cycle); "
-             "overrides forecast_hours from config.yaml.",
+             "overrides forecast_hours from config.yaml. Conflicts with --fhours.",
     )
     # ── Discovery commands ────────────────────────────────────────────
     parser.add_argument(
@@ -324,15 +400,20 @@ def main():
 
     if args.date is not None and args.date_range is not None:
         parser.error("--date and --date-range are mutually exclusive")
-    if args.cycle is not None and args.cycles is not None:
-        parser.error("--cycle and --cycles are mutually exclusive")
+    if args.fhours is not None and args.all_hours:
+        parser.error("--fhours and --all-hours are mutually exclusive")
+    if args.plot and args.no_plot:
+        parser.error("--plot and --no-plot are mutually exclusive")
 
     config_path = Path(__file__).parent / "config.yaml" if args.demo else args.config
     config = load_config(config_path)
     apply_cli_overrides(config, args)
 
+    # Plot resolution priority: --no-plot > --plot / --demo > config.yaml
     if args.no_plot:
         config.plot.enabled = False
+    elif args.plot or args.demo:
+        config.plot.enabled = True
 
     if args.list_hours:
         cmd_list_hours(args, config)
@@ -342,6 +423,7 @@ def main():
         cmd_list_vars(args, config)
         return
 
+    setup_file_logging(Path(config.output_dir))
     cmd_download(args, config)
 
 
