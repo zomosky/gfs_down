@@ -3,9 +3,14 @@
 import glob
 import json
 import logging
+import sys
 from datetime import datetime
 from pathlib import Path
 
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
+
+from gfsdown import downloader as _downloader
 from gfsdown.config import GFSConfig
 from gfsdown.downloader import (
     build_grib_url,
@@ -197,38 +202,66 @@ def download_all(
 
     succeeded: list[tuple[str, int, Path]] = []
     failed: list[tuple[str, int, int, str]] = []
-    for date in dates:
-        for cycle in cycles:
-            out_dir = date_output_dir(base_dir, date, cycle)
-            out_dir.mkdir(parents=True, exist_ok=True)
 
-            if config.all_hours:
-                try:
-                    hours = list_available_forecast_hours(date, cycle)
-                except Exception as e:
-                    logger.error(f"Failed S3 LIST for {date} {cycle:02d}Z, skipping: {e}")
-                    failed.append((date, cycle, -1, f"S3 LIST failed: {e}"))
-                    continue
-                if not hours:
-                    logger.warning(f"No forecast files found on S3 for {date} {cycle:02d}Z, skipping")
-                    continue
-                logger.info(
-                    f"=== {date} {cycle:02d}Z -> {out_dir}  "
-                    f"(all-hours: {len(hours)} files, f{hours[0]:03d}-f{hours[-1]:03d}) ==="
-                )
-            else:
-                hours = config.forecast_hours.hours
-                logger.info(f"=== {date} {cycle:02d}Z -> {out_dir} ===")
+    # Outer "files" progress bar: ticks once per (date, cycle, hour) processed
+    # (success, skip, or fail all count). For all-hours mode the total is grown
+    # lazily as each init's hour list is discovered.
+    if config.all_hours:
+        outer_total: int | None = None  # discovered per-init
+    else:
+        outer_total = len(dates) * len(cycles) * len(config.forecast_hours.hours)
 
-            for hour in hours:
-                try:
-                    result = download_forecast_hour(config, date, cycle, hour, out_dir)
-                except DownloadError as e:
-                    logger.error(f"Failed {date} {cycle:02d}Z f{hour:03d}: {e}")
-                    failed.append((date, cycle, hour, str(e)))
-                    continue
-                if result:
-                    succeeded.append((date, cycle, result))
+    progress_on = _downloader.PROGRESS_ENABLED and sys.stderr.isatty()
+    file_bar = tqdm(
+        total=outer_total,
+        desc="Files",
+        unit="file",
+        position=0,
+        dynamic_ncols=True,
+        disable=not progress_on,
+    )
+
+    # Route logging through tqdm so log lines don't interleave with the bars.
+    with logging_redirect_tqdm():
+        for date in dates:
+            for cycle in cycles:
+                out_dir = date_output_dir(base_dir, date, cycle)
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                if config.all_hours:
+                    try:
+                        hours = list_available_forecast_hours(date, cycle)
+                    except Exception as e:
+                        logger.error(f"Failed S3 LIST for {date} {cycle:02d}Z, skipping: {e}")
+                        failed.append((date, cycle, -1, f"S3 LIST failed: {e}"))
+                        continue
+                    if not hours:
+                        logger.warning(f"No forecast files found on S3 for {date} {cycle:02d}Z, skipping")
+                        continue
+                    # Grow the outer bar's total as each init's hour list is discovered.
+                    file_bar.total = (file_bar.total or 0) + len(hours)
+                    file_bar.refresh()
+                    logger.info(
+                        f"=== {date} {cycle:02d}Z -> {out_dir}  "
+                        f"(all-hours: {len(hours)} files, f{hours[0]:03d}-f{hours[-1]:03d}) ==="
+                    )
+                else:
+                    hours = config.forecast_hours.hours
+                    logger.info(f"=== {date} {cycle:02d}Z -> {out_dir} ===")
+
+                for hour in hours:
+                    try:
+                        result = download_forecast_hour(config, date, cycle, hour, out_dir)
+                    except DownloadError as e:
+                        logger.error(f"Failed {date} {cycle:02d}Z f{hour:03d}: {e}")
+                        failed.append((date, cycle, hour, str(e)))
+                        file_bar.update(1)
+                        continue
+                    if result:
+                        succeeded.append((date, cycle, result))
+                    file_bar.update(1)
+
+    file_bar.close()
 
     if failed:
         logger.error(

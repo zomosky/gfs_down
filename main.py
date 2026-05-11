@@ -351,6 +351,11 @@ def main():
         action="store_true",
         help="Run demo with the project's config.yaml and force plotting on.",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars (auto-disabled when stderr is not a TTY).",
+    )
     # ── Lightweight overrides for config.yaml ─────────────────────────
     parser.add_argument(
         "--date",
@@ -414,6 +419,12 @@ def main():
         config.plot.enabled = False
     elif args.plot or args.demo:
         config.plot.enabled = True
+
+    # Progress-bar toggle: explicit --no-progress wins; otherwise tqdm itself
+    # also auto-disables when stderr is not a TTY.
+    if args.no_progress:
+        from gfsdown import downloader as _dl
+        _dl.PROGRESS_ENABLED = False
 
     if args.list_hours:
         cmd_list_hours(args, config)

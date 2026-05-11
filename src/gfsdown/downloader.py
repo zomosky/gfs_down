@@ -2,11 +2,14 @@
 
 import logging
 import re
+import sys
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import Callable
 
 import requests
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +19,13 @@ S3_NS = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
 # Retry settings
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds, doubles each retry
+
+# Streaming chunk size for byte-range downloads (64 KB balances rate granularity vs overhead).
+STREAM_CHUNK_BYTES = 64 * 1024
+
+# Progress-bar toggle. main() flips this to False when --no-progress is set
+# or stderr is not a TTY (e.g. piped to a log file).
+PROGRESS_ENABLED = True
 
 
 def build_grib_url(date: str, cycle: int, forecast_hour: int) -> str:
@@ -55,25 +65,47 @@ def download_text(url: str) -> str:
                 raise
 
 
-def download_byte_range(url: str, start: int, end: int) -> bytes:
-    """Download a byte range from the file using HTTP Range header."""
+def download_byte_range(
+    url: str,
+    start: int,
+    end: int,
+    progress_cb: Callable[[int], None] | None = None,
+) -> bytes:
+    """Download a byte range from the file using HTTP Range header.
+
+    If ``progress_cb`` is provided, it is called with each chunk's byte count
+    as the response streams in. On a retried attempt, any bytes counted before
+    the failure are rolled back via ``progress_cb(-bytes_in_attempt)`` so the
+    caller's bar stays accurate.
+    """
     range_header = f"bytes={start}-{end}"
     for attempt in range(MAX_RETRIES):
+        bytes_in_attempt = 0
         try:
-            resp = requests.get(
+            with requests.get(
                 url,
                 headers={"Range": range_header},
                 timeout=120,
-            )
-            if resp.status_code == 206:
-                return resp.content
-            elif resp.status_code == 200:
-                # Server doesn't support range requests, return all
-                logger.warning(f"Server returned full file (200) instead of 206 for {url}")
-                return resp.content
-            else:
-                resp.raise_for_status()
+                stream=True,
+            ) as resp:
+                if resp.status_code not in (200, 206):
+                    resp.raise_for_status()
+                if resp.status_code == 200:
+                    # Server doesn't support range requests, return all
+                    logger.warning(f"Server returned full file (200) instead of 206 for {url}")
+                chunks: list[bytes] = []
+                for chunk in resp.iter_content(chunk_size=STREAM_CHUNK_BYTES):
+                    if not chunk:
+                        continue
+                    chunks.append(chunk)
+                    bytes_in_attempt += len(chunk)
+                    if progress_cb is not None:
+                        progress_cb(len(chunk))
+                return b"".join(chunks)
         except requests.RequestException as e:
+            if progress_cb is not None and bytes_in_attempt:
+                # Roll back partial progress so the bar doesn't double-count on retry.
+                progress_cb(-bytes_in_attempt)
             delay = RETRY_DELAY * (2 ** attempt)
             logger.warning(f"Range download failed (attempt {attempt+1}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES - 1:
@@ -90,6 +122,10 @@ def download_sliced_grib(
 ) -> Path:
     """Download multiple byte ranges and concatenate into a single .grib2 file.
 
+    Renders a per-file tqdm bar showing bytes-downloaded / total + live transfer
+    rate (e.g. ``2.34MB/s``). The bar is suppressed when
+    ``PROGRESS_ENABLED`` is False or stderr is not a TTY.
+
     Args:
         entries_with_ranges: List of (start, end) byte offsets. Adjacent ranges
             will be automatically merged to reduce HTTP requests.
@@ -100,15 +136,36 @@ def download_sliced_grib(
         Path to the output file.
     """
     merged = merge_ranges(entries_with_ranges)
-    logger.info(f"Downloading {len(merged)} merged ranges from {Path(url).name}")
+    total_bytes = sum(end - start + 1 for start, end in merged)
+    logger.info(
+        f"Downloading {len(merged)} merged ranges from {Path(url).name} "
+        f"({total_bytes:,} bytes)"
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(output_path, "wb") as f:
-        for i, (start, end) in enumerate(merged):
-            logger.info(f"  Range {i+1}/{len(merged)}: bytes {start}-{end} ({end - start + 1:,} bytes)")
-            data = download_byte_range(url, start, end)
-            f.write(data)
+    bar = tqdm(
+        total=total_bytes,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+        desc=f"  {output_path.name}",
+        leave=False,
+        dynamic_ncols=True,
+        disable=not (PROGRESS_ENABLED and sys.stderr.isatty()),
+        position=1,
+    )
+    try:
+        with open(output_path, "wb") as f:
+            for i, (start, end) in enumerate(merged):
+                logger.info(
+                    f"  Range {i+1}/{len(merged)}: bytes {start}-{end} "
+                    f"({end - start + 1:,} bytes)"
+                )
+                data = download_byte_range(url, start, end, progress_cb=bar.update)
+                f.write(data)
+    finally:
+        bar.close()
 
     return output_path
 

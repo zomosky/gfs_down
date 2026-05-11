@@ -14,6 +14,7 @@ dependencies = [
     "cartopy>=0.23",
     "eccodes>=2.47",
     "eccodeslib>=2.46.2.19",
+    "tqdm>=4.67.3",
 ]
 
 [build-system]
