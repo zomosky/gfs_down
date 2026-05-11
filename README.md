@@ -155,9 +155,9 @@ uv run main.py --list-vars --hour 6  # ✅ 查 f006 idx 里有什么变量
 
 简单记忆：**`--fhours` 是干活的，`--hour` 是查表的**。
 
-### 下载进度条
+### 下载进度
 
-下载时默认显示两层 tqdm 进度条：
+#### 交互终端 —— 双层 tqdm 进度条
 
 ```
 Files:  35%|███▌      | 14/40 [02:13<04:08,  9.5s/file]
@@ -166,11 +166,29 @@ Files:  35%|███▌      | 14/40 [02:13<04:08,  9.5s/file]
 
 - **外层 `Files`**：整体文件进度（已完成 / 总数），含 ETA 与单文件平均耗时。
 - **内层 `gfs_fXXX.grib2`**：当前文件的下载字节数 / 总字节数 + **实时网速**（自动 KB/s ↔ MB/s）。
-- 跳过的（已下载并通过 cfgrib 校验）也会让外层 bar +1，但不会出现内层 bar。
+- 跳过的（已下载并通过 cfgrib 校验）也让外层 bar +1，但不会出现内层 bar。
 - 失败的同样 +1，且 `last_run.json` 会记下失败条目。
 
-非交互场景（管道、重定向到日志、CI 环境）会**自动关闭**进度条，避免日志里塞满 ANSI 控制字符；
-也可显式禁用：
+#### 后台运行 / `nohup &` / `tail -f log` —— `[N/M]` 进度前缀
+
+非交互场景（管道、重定向到日志、CI 环境）会**自动关闭**进度条，避免 ANSI 控制字符
+塞满日志。但每一条关键日志行都带 `[N/M]` 前缀，方便后台挂起后用 `tail -f` 看进度：
+
+```
+12:34:01 [INFO] [14/40] Fetching index for 2026-01-01 12Z f014: gfs.t12z.pgrb2.0p25.f014.idx
+12:34:03 [INFO] [14/40] Saved 20260101/12z/gfs_f014.grib2 (32,514,231 bytes)
+12:34:03 [INFO] [15/40] Skipping 2026-01-01 12Z f015: already downloaded (32,498,776 bytes ...)
+12:34:03 [INFO] [16/40] Fetching index for 2026-01-01 12Z f016: ...
+```
+
+典型用法：
+
+```bash
+nohup uv run main.py --date-range 2026-01-01:2026-02-01 --cycles 0,12 > run.log 2>&1 &
+tail -f run.log | grep -E "\[\d+/\d+\]"   # 只看进度行
+```
+
+也可显式禁用 bar（不影响 `[N/M]` 前缀）：
 
 ```bash
 uv run main.py --no-progress

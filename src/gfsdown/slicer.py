@@ -86,25 +86,31 @@ def download_forecast_hour(
     cycle: int,
     forecast_hour: int,
     output_dir: Path,
+    progress_label: str = "",
 ) -> Path | None:
     """Download sliced GRIB2 for one (date, cycle, forecast_hour).
 
     Returns the output file path on success or when the file already exists
     (resume), or None when no requested variable is present in the idx.
     Raises DownloadError if any underlying HTTP step fails after retries.
+
+    ``progress_label`` is an optional ``"[N/M] "`` prefix injected into the
+    main log lines so background runs (nohup / piped to file) can tail the
+    log and see overall progress without needing a tqdm TTY.
     """
     output_path = output_dir / f"gfs_f{forecast_hour:03d}.grib2"
+    pfx = f"{progress_label} " if progress_label else ""
 
     # Resume: skip files already on disk that pass a lightweight metadata check.
     if output_path.exists() and output_path.stat().st_size >= MIN_VALID_GRIB_BYTES:
         if _validate_existing_grib(output_path):
             logger.info(
-                f"Skipping {date} {cycle:02d}Z f{forecast_hour:03d}: already downloaded "
+                f"{pfx}Skipping {date} {cycle:02d}Z f{forecast_hour:03d}: already downloaded "
                 f"({output_path.stat().st_size:,} bytes at {output_path})"
             )
             return output_path
         logger.warning(
-            f"Existing file {output_path} failed metadata validation; will re-download"
+            f"{pfx}Existing file {output_path} failed metadata validation; will re-download"
         )
         try:
             output_path.unlink()
@@ -115,7 +121,7 @@ def download_forecast_hour(
     idx_url = build_idx_url(date, cycle, forecast_hour)
     grib_url = build_grib_url(date, cycle, forecast_hour)
 
-    logger.info(f"Fetching index for {date} {cycle:02d}Z f{forecast_hour:03d}: {Path(idx_url).name}")
+    logger.info(f"{pfx}Fetching index for {date} {cycle:02d}Z f{forecast_hour:03d}: {Path(idx_url).name}")
 
     try:
         idx_text = download_text(idx_url)
@@ -156,7 +162,12 @@ def download_forecast_hour(
         raise DownloadError(f"byte-range fetch failed: {e}") from e
 
     file_size = output_path.stat().st_size
-    logger.info(f"  Saved {output_path.relative_to(output_path.parents[2]) if len(output_path.parents) >= 3 else output_path.name} ({file_size:,} bytes)")
+    rel = (
+        output_path.relative_to(output_path.parents[2])
+        if len(output_path.parents) >= 3
+        else output_path.name
+    )
+    logger.info(f"{pfx}Saved {rel} ({file_size:,} bytes)")
 
     return output_path
 
@@ -221,6 +232,12 @@ def download_all(
         disable=not progress_on,
     )
 
+    # Counter for "[N/M]" log prefix so background runs (nohup, redirected
+    # to file) can tail the log and see overall progress without a TTY bar.
+    # In all-hours mode total starts at 0 and grows as each init is discovered.
+    done = 0
+    total = outer_total or 0
+
     # Route logging through tqdm so log lines don't interleave with the bars.
     with logging_redirect_tqdm():
         for date in dates:
@@ -241,6 +258,7 @@ def download_all(
                     # Grow the outer bar's total as each init's hour list is discovered.
                     file_bar.total = (file_bar.total or 0) + len(hours)
                     file_bar.refresh()
+                    total += len(hours)
                     logger.info(
                         f"=== {date} {cycle:02d}Z -> {out_dir}  "
                         f"(all-hours: {len(hours)} files, f{hours[0]:03d}-f{hours[-1]:03d}) ==="
@@ -250,10 +268,14 @@ def download_all(
                     logger.info(f"=== {date} {cycle:02d}Z -> {out_dir} ===")
 
                 for hour in hours:
+                    done += 1
+                    label = f"[{done}/{total}]"
                     try:
-                        result = download_forecast_hour(config, date, cycle, hour, out_dir)
+                        result = download_forecast_hour(
+                            config, date, cycle, hour, out_dir, progress_label=label
+                        )
                     except DownloadError as e:
-                        logger.error(f"Failed {date} {cycle:02d}Z f{hour:03d}: {e}")
+                        logger.error(f"{label} Failed {date} {cycle:02d}Z f{hour:03d}: {e}")
                         failed.append((date, cycle, hour, str(e)))
                         file_bar.update(1)
                         continue
