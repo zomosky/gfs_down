@@ -3,7 +3,7 @@
 
 # Forecast initialization date (YYYY-MM-DD).
 # Used when `date_range` below is not set.
-date: "2025-01-01"
+date: "2026-01-01"
 
 # Optional date range for batch / historical downloads.
 # When present, this OVERRIDES `date` and downloads every cycle init in [start, end].

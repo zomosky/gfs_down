@@ -20,8 +20,9 @@ warnings.filterwarnings(
 from gfsdown.config import VALID_CYCLES, DateRange, ForecastRange, load_config
 from gfsdown.downloader import build_idx_url, download_text, list_available_forecast_hours
 from gfsdown.index_parser import classify_variables, list_all_variables, parse_idx
+from gfsdown.manifest import generate_manifest, write_manifest
 from gfsdown.plotter import compute_wind_speed, plot_wind_speed
-from gfsdown.slicer import download_all
+from gfsdown.slicer import date_output_dir, download_all
 
 
 def parse_date_range_arg(value: str) -> DateRange:
@@ -157,9 +158,64 @@ def cmd_download(args, config):
     else:
         logger.info(f"Download complete: {len(downloaded)} file(s)")
 
+    # Generate manifest files for climate_restore compatibility
+    logger.info("Generating manifest files for climate_restore...")
+    generate_manifests_for_downloads(config, downloaded)
+
     # Plot if enabled
     if config.plot.enabled and config.plot.plot_type == "wind_speed":
         plot_results(config, downloaded)
+
+
+def generate_manifests_for_downloads(config, downloaded_files: list[tuple[str, int, Path]]) -> None:
+    """Generate manifest.json files for downloaded data.
+
+    Groups downloaded files by (date, cycle) and generates one manifest per group.
+
+    Args:
+        config: GFS configuration
+        downloaded_files: List of (date, cycle, path) tuples from download_all
+    """
+    from collections import defaultdict
+
+    # Group by (date, cycle)
+    groups = defaultdict(list)
+    for date, cycle, path in downloaded_files:
+        groups[(date, cycle)].append(path)
+
+    output_dir = Path(config.output_dir)
+    source_name = "gfs-0p25"  # Hardcoded for now; could be made configurable
+
+    for (date, cycle), paths in groups.items():
+        # Format date as YYYYMMDD
+        date_str = date.replace("-", "")
+
+        # Determine cycle directory
+        cycle_dir = date_output_dir(output_dir, date, cycle)
+
+        # Manifest path
+        manifest_path = cycle_dir / f"{date_str}_{cycle:02d}z_{source_name}.manifest.json"
+
+        if manifest_path.exists():
+            logger.info(f"Manifest already exists: {manifest_path}")
+            continue
+
+        try:
+            # Generate manifest (use default variables definition)
+            manifest = generate_manifest(
+                output_dir=output_dir,
+                date_str=date_str,
+                cycle=cycle,
+                source_name=source_name,
+                compute_hash=False,  # Skip SHA-256 for speed
+            )
+
+            # Write manifest
+            write_manifest(manifest, manifest_path)
+            logger.info(f"Generated manifest: {manifest_path} ({len(paths)} files)")
+
+        except Exception as exc:
+            logger.error(f"Failed to generate manifest for {date} {cycle:02d}Z: {exc}")
 
 
 def plot_results(config, downloaded_files):

@@ -243,6 +243,7 @@ output/
 │   ├── 00z/
 │   │   ├── gfs_f000.grib2
 │   │   ├── gfs_f006.grib2
+│   │   ├── 20260101_00z_gfs-0p25.manifest.json  # climate_restore 清单
 │   │   └── plots/
 │   │       ├── wind_f000.png
 │   │       └── wind_f006.png
@@ -266,6 +267,91 @@ output/
   ]
 }
 ```
+
+## Manifest 生成（climate_restore 兼容）
+
+gfsdown 会自动为下载的数据生成 `manifest.json` 文件，用于 [climate_restore](../climate_restorage) 的批量后处理（GRIB2 → NetCDF/Zarr）。
+
+### 自动生成
+
+每次下载完成后，gfsdown 会自动为每个 `(date, cycle)` 组合生成 manifest 文件：
+
+```bash
+uv run main.py --date-range 2026-01-01:2026-02-01 --cycles 12
+# 下载完成后自动生成 manifest
+```
+
+Manifest 文件保存在对应日期/轮次目录下：
+```
+output/20260101/12z/20260101_12z_gfs-0p25.manifest.json
+```
+
+### 为历史数据生成 Manifest
+
+如果已经有下载好的数据但没有 manifest，可以使用独立脚本生成：
+
+```bash
+# 为所有数据生成 manifest
+python generate_manifest.py
+
+# 为指定日期范围生成
+python generate_manifest.py --date-range 2026-01-01:2026-02-01
+
+# 为指定日期生成
+python generate_manifest.py --date 2026-01-01
+
+# 预览模式（不实际写入）
+python generate_manifest.py --dry-run
+
+# 计算 SHA-256 校验和（较慢）
+python generate_manifest.py --compute-sha256
+
+# 指定输出目录
+python generate_manifest.py --output-dir ./my_data
+```
+
+### Manifest 文件结构
+
+```json
+{
+  "schema_version": 1,
+  "source": {
+    "name": "gfs-0p25",
+    "description": "NOAA GFS 0.25° atmos forecast (NCEP), downloaded by gfsdown"
+  },
+  "init_time": "2026-01-01T12:00:00+00:00",
+  "date": "20260101",
+  "cycle": 12,
+  "completed_at": "2026-06-22T17:20:14.683770+00:00",
+  "variables": [...],
+  "files": [
+    {
+      "step_hours": 0,
+      "path": "output/gfs-0p25/20260101/12z/gfs_f000.grib2",
+      "size_bytes": 24489034,
+      "sha256": "...",
+      ...
+    }
+  ]
+}
+```
+
+### 与 climate_restore 集成
+
+生成 manifest 后，可以直接使用 `batch_restore.py` 批量处理数据：
+
+```bash
+# 在 climate_restorage 目录下
+cd ../climate_restorage
+
+# 预览待处理的 manifest
+python batch_restore.py --dry-run
+
+# 批量处理（GRIB2 → Zarr/NetCDF）
+python batch_restore.py
+```
+
+详见 [climate_restore 文档](../climate_restorage/README.md)。
 
 ## 工作原理
 
