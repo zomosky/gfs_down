@@ -194,7 +194,7 @@ def main() -> int:
 
         try:
             manifest = generate_manifest(
-                data_root=output_dir,
+                output_dir=output_dir,
                 date_str=date_yyyymmdd,
                 cycle=cycle,
                 source_name=source_name,
