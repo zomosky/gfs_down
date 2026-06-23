@@ -85,6 +85,7 @@ def generate_manifest(
     source_name: str = "gfs-0p25",
     compute_hash: bool = False,
     variables: list[dict] | None = None,
+    include_source_in_path: bool = False,
 ) -> dict:
     """Generate manifest dictionary for a specific (date, cycle).
 
@@ -95,13 +96,19 @@ def generate_manifest(
         source_name: Source identifier (default: "gfs-0p25")
         compute_hash: Whether to compute SHA-256 hashes (slow)
         variables: List of variable definitions (if None, uses default)
+        include_source_in_path: If True, look for data in output_dir/source_name/date/cycle
+                               If False, look in output_dir/date/cycle
 
     Returns:
         Manifest dictionary
     """
-    # gfsdown output structure: <output_dir>/<YYYYMMDD>/<CC>z/
-    # (no source_name subdirectory)
-    cycle_dir = output_dir / date_str / f"{cycle:02d}z"
+    # Determine data directory structure
+    if include_source_in_path:
+        # Structure: <output_dir>/<source_name>/<YYYYMMDD>/<CC>z/
+        cycle_dir = output_dir / source_name / date_str / f"{cycle:02d}z"
+    else:
+        # Structure: <output_dir>/<YYYYMMDD>/<CC>z/
+        cycle_dir = output_dir / date_str / f"{cycle:02d}z"
 
     if not cycle_dir.exists():
         raise FileNotFoundError(f"Directory not found: {cycle_dir}")

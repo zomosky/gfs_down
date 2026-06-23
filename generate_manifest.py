@@ -199,6 +199,7 @@ def main() -> int:
                 cycle=cycle,
                 source_name=source_name,
                 compute_hash=args.compute_sha256,
+                include_source_in_path=True,  # Data is in output_dir/source_name/date/cycle
             )
 
             write_manifest(manifest, manifest_path)

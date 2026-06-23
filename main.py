@@ -208,6 +208,7 @@ def generate_manifests_for_downloads(config, downloaded_files: list[tuple[str, i
                 cycle=cycle,
                 source_name=source_name,
                 compute_hash=False,  # Skip SHA-256 for speed
+                include_source_in_path=False,  # gfsdown output: output_dir/date/cycle
             )
 
             # Write manifest
